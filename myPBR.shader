@@ -31,10 +31,13 @@ Shader "Custom/myPBR"
 			
 			#include "UnityCG.cginc"
 			#include "UnityStandardBRDF.cginc"
-			            #include "Lighting.cginc"
+			#include "Lighting.cginc"
 						#include "UnityPBSLighting.cginc"
 						#include "AutoLight.cginc"
 
+			//接受被投射阴影
+			#pragma multi_compile_fwdbase_fullshadows
+			 #define UNITY_PASS_FORWARDBASE
 			uniform float4 _Color;
             uniform sampler2D _MainTex; uniform float4 _MainTex_ST;
             uniform sampler2D _BumpMap; uniform float4 _BumpMap_ST;
@@ -61,7 +64,7 @@ Shader "Custom/myPBR"
 				float2 uv0 : TEXCOORD1;
 				float2 uv1 : TEXCOORD2;
 
-				float4 vertex : SV_POSITION;
+				float4 pos : SV_POSITION;
 				float4 posWorld : TEXCOORD3;
 				float3 normalDir : TEXCOORD4;
                 float3 tangentDir : TEXCOORD5;
@@ -76,7 +79,7 @@ Shader "Custom/myPBR"
 			v2f vert (appdata v)
 			{
 				v2f o= (v2f)0;
-				o.vertex = UnityObjectToClipPos(v.vertex);
+				o.pos = UnityObjectToClipPos(v.vertex);
 				o.uv = TRANSFORM_TEX(v.uv, _MainTex);
 				o.uv0 = TRANSFORM_TEX(v.uv0, _Specular);
 				//法线贴图
@@ -88,10 +91,17 @@ Shader "Custom/myPBR"
                 o.bitangentDir = normalize(cross(o.normalDir, o.tangentDir) * v.tangent.w);
 				o.posWorld = mul(unity_ObjectToWorld, v.vertex);
 
-                   //o.ambientOrLightmapUV.xy = v.uv1.xy * unity_LightmapST.xy + unity_LightmapST.zw;
-                   //o.ambientOrLightmapUV.zw = 0;
-				UNITY_TRANSFER_FOG(o,o.vertex);
-				                //TRANSFER_VERTEX_TO_FRAGMENT(o)
+				#ifdef LIGHTMAP_ON
+                    o.ambientOrLightmapUV.xy = v.uv0.xy * unity_LightmapST.xy + unity_LightmapST.zw;
+                    o.ambientOrLightmapUV.zw = 0;
+                #elif UNITY_SHOULD_SAMPLE_SH
+                #endif
+                #ifdef DYNAMICLIGHTMAP_ON
+                    o.ambientOrLightmapUV.zw = v.uv1.xy * unity_DynamicLightmapST.xy + unity_DynamicLightmapST.zw;
+                #endif
+
+				UNITY_TRANSFER_FOG(o,o.pos);
+				TRANSFER_VERTEX_TO_FRAGMENT(o)
 				return o;
 			}
 						
@@ -130,7 +140,8 @@ Shader "Custom/myPBR"
 				fixed4 mainTexCol = tex2D(_MainTex, i.uv);
 				//float3 diffuseColor = 1.0-2.0*((mainTexCol.rgb*_Color.rgb)-0.5);
 				//float3 diffuseColor = 2.0*(mainTexCol.rgb*_Color.rgb);
-				float3 diffuseColor =_colovalue* mainTexCol.rgb*_Color.rgb;
+				//float3 diffuseColor =_colovalue* mainTexCol.rgb*_Color.rgb;
+				float3 diffuseColor = (_colovalue*saturate(( (mainTexCol.rgb*_Color.rgb) > 0.5 ? (1.0-(1.0-2.0*((mainTexCol.rgb*_Color.rgb)-0.5))) : (2.0*(mainTexCol.rgb*_Color.rgb)) ))); // Need this for specular when using metallic
 				
 				//GI
 				float3 lightColor = _LightColor0.rgb;
@@ -167,7 +178,7 @@ Shader "Custom/myPBR"
 
 				half dCol = GGXTerm(NdotH,roughness);
 				//G项
-				half gTerm = SmithJointGGXVisibilityTerm(NdotH,NdotV,roughness);
+				half gTerm = SmithJointGGXVisibilityTerm(NdotL,NdotV,roughness);
 				//F项
 				half3 fCol = FresnelTerm(specularColor,LdotH);
 				//测试
@@ -182,12 +193,12 @@ Shader "Custom/myPBR"
 				specularPBL *= any(specularColor) ? 1.0 : 0.0;
 
 				//half direSpec = dCol*gTerm*fCol;
-				half direSpec = attenColor*specularPBL*fCol;
+				float3 direSpec = attenColor*specularPBL*fCol;
 
 				half grazingTerm = saturate( gloss + specularMonochrome )*_fresnelvalue;
 				//趋向grazingTerm，最大值
-				//float3 indirectSpecular = FresnelLerp (specularColor, grazingTerm, NdotV);
-				float3 indirectSpecular = gi.indirect.specular + spcCol.a*_reflectionadd;
+				//float3 indirectSpecular = gi.indirect.specular + spcCol.a*_reflectionadd;
+				float3 indirectSpecular = gi.indirect.specular + spcCol.a*texCUBE(_reflectmap,viewReflectDirection).rgb*_reflectionadd;
 				half surfaceReduction;
                 #ifdef UNITY_COLORSPACE_GAMMA
                     surfaceReduction = 1.0-0.28*roughness*perceptualRoughness;
@@ -212,12 +223,177 @@ Shader "Custom/myPBR"
 
 				float3 finCol = (directDiffuse+indirectDiffuse)*diffuseColor + direSpec + indirectSpecular;
 				//float3 finCol = diffuseColor + direSpec;
-				float4 col = float4(finCol,0);
+				float4 col = float4(finCol,1);
 				// apply fog
 				UNITY_APPLY_FOG(i.fogCoord, col);
 				return col;
 			}
 			ENDCG
 		}
+		Pass
+		{
+		   Name "PBRFORWARDADD"
+            Tags {
+                "LightMode"="ForwardAdd"
+            }
+			//两种颜色完全相加
+            Blend One One
+
+			CGPROGRAM
+			#pragma vertex vert
+			#pragma fragment frag
+			#define UNITY_PASS_FORWARDADD
+			// make fog work
+			#pragma multi_compile_fog
+			
+			#include "UnityCG.cginc"
+			#include "UnityStandardBRDF.cginc"
+			#include "Lighting.cginc"
+			#include "UnityPBSLighting.cginc"
+			#include "AutoLight.cginc"
+
+			//接受被投射阴影
+			#pragma multi_compile_fwdadd_fullshadows
+			uniform float4 _Color;
+            uniform sampler2D _MainTex; uniform float4 _MainTex_ST;
+            uniform sampler2D _BumpMap; uniform float4 _BumpMap_ST;
+            uniform sampler2D _Specular; uniform float4 _Specular_ST;
+            uniform float _reflectionadd;
+            uniform samplerCUBE _reflectmap;
+            uniform float _colovalue;
+            uniform float _fresnelvalue;
+
+			struct appdata
+			{
+				float4 vertex : POSITION;
+				float2 uv : TEXCOORD0;
+				float2 uv0 : TEXCOORD1;
+				float2 uv1 : TEXCOORD2;
+
+				float3 normal : NORMAL;
+                float4 tangent : TANGENT;
+			};
+
+			struct v2f
+			{
+				float2 uv : TEXCOORD0;
+				float2 uv0 : TEXCOORD1;
+				float2 uv1 : TEXCOORD2;
+
+				float4 pos : SV_POSITION;
+				float4 posWorld : TEXCOORD3;
+				float3 normalDir : TEXCOORD4;
+                float3 tangentDir : TEXCOORD5;
+                float3 bitangentDir : TEXCOORD6;
+				LIGHTING_COORDS(7,8)
+				UNITY_FOG_COORDS(9)
+			};
+			
+			v2f vert (appdata v)
+			{
+				v2f o= (v2f)0;
+				o.pos = UnityObjectToClipPos(v.vertex);
+				o.uv = TRANSFORM_TEX(v.uv, _MainTex);
+				o.uv0 = TRANSFORM_TEX(v.uv0, _Specular);
+				//法线贴图
+				o.uv1 = TRANSFORM_TEX(v.uv1, _BumpMap);
+
+				o.normalDir = UnityObjectToWorldNormal(v.normal);
+                o.tangentDir = UnityObjectToWorldDir(v.tangent.xyz);
+				//副切线
+                o.bitangentDir = normalize(cross(o.normalDir, o.tangentDir) * v.tangent.w);
+				o.posWorld = mul(unity_ObjectToWorld, v.vertex);
+
+				UNITY_TRANSFER_FOG(o,o.pos);
+				TRANSFER_VERTEX_TO_FRAGMENT(o)
+				return o;
+			}
+						
+			fixed4 frag (v2f i) : COLOR
+			{
+			//环境光
+				float attenuation = LIGHT_ATTENUATION(i);
+                float3 attenColor = attenuation * _LightColor0.xyz;
+
+				i.normalDir = normalize(i.normalDir);
+				float3 normalDirection = i.normalDir;
+				//切线空间到世界空间的变换矩阵
+				float3x3 tangentTransform = float3x3(i.tangentDir,i.bitangentDir,i.normalDir);
+				//法线贴图
+				float3 _BumpMap_var = UnpackNormal(tex2D(_BumpMap,i.uv1));
+
+                float3 node_8283 =_BumpMap_var.rgb + float3(0,0,1);
+                float3 normalLocal = node_8283;
+				//将法线的切线空间转到世界空间
+				float3 bumpWorld = normalize( mul(normalLocal,tangentTransform));
+				normalDirection = bumpWorld;
+				float3 viewDirection = normalize(_WorldSpaceCameraPos.xyz - i.posWorld.xyz);
+
+				float3 lightDirection = normalize(lerp(_WorldSpaceLightPos0.xyz, _WorldSpaceLightPos0.xyz - i.posWorld.xyz,_WorldSpaceLightPos0.w));
+				//float3 lightDirection = normalize(_WorldSpaceLightPos0.xyz);
+
+				float NdotL = saturate(dot( normalDirection, lightDirection ));
+				float NdotV = abs(dot( normalDirection, viewDirection ));
+				float3 halfDirection = normalize(viewDirection+lightDirection);
+				half NdotH = saturate(dot( normalDirection, halfDirection ));
+                float LdotH = saturate(dot(lightDirection, halfDirection));
+
+				//高光贴图
+				fixed4 spcCol = tex2D(_Specular, i.uv0);
+				float perceptualRoughness = 1.0 - spcCol.a;
+				half roughness = perceptualRoughness*perceptualRoughness;
+				float3 specularColor = spcCol.rgb;
+                float gloss = spcCol.a;
+
+				// sample the texture
+				fixed4 mainTexCol = tex2D(_MainTex, i.uv);
+				//float3 diffuseColor =_colovalue* mainTexCol.rgb*_Color.rgb;
+				float3 diffuseColor = (_colovalue*saturate(( (mainTexCol.rgb*_Color.rgb) > 0.5 ? (1.0-(1.0-2.0*((mainTexCol.rgb*_Color.rgb)-0.5))) : (2.0*(mainTexCol.rgb*_Color.rgb)) ))); // Need this for specular when using metallic
+				
+                float specularMonochrome;
+                diffuseColor = EnergyConservationBetweenDiffuseAndSpecular(diffuseColor, specularColor, specularMonochrome);
+				//这是最亮的颜色值
+                specularMonochrome = 1.0-specularMonochrome;
+				//BRDF d项
+
+				half dCol = GGXTerm(NdotH,roughness);
+				//G项
+				half gTerm = SmithJointGGXVisibilityTerm(NdotL,NdotV,roughness);
+				//F项
+				half3 fCol = FresnelTerm(specularColor,LdotH);
+				//测试
+				float specularPBL = (dCol*gTerm) * UNITY_PI;
+				#ifdef UNITY_COLORSPACE_GAMMA
+                    specularPBL = sqrt(max(1e-4h, specularPBL));
+                #endif
+				//不会为负数
+				specularPBL = max(0, specularPBL * NdotL);
+				#if defined(_SPECULARHIGHLIGHTS_OFF)
+                    specularPBL = 0.0;
+                #endif
+				//any 参数里的任意一个元素不为零
+				specularPBL *= any(specularColor) ? 1.0 : 0.0;
+
+				float3 direSpec = attenColor*specularPBL*fCol;
+
+                NdotL = max(0.0,dot( normalDirection, lightDirection ));
+                half fd90 = 0.5 + 2 * LdotH * LdotH * (1-gloss);
+                float nlPow5 = Pow5(1-NdotL);
+                float nvPow5 = Pow5(1-NdotV);
+				//直射漫反射，菲涅尔公式
+                float3 directDiffuse = ((1 +(fd90 - 1)*nlPow5) * (1 + (fd90 - 1)*nvPow5) * NdotL) * attenColor;
+
+				diffuseColor *= 1-specularMonochrome;
+
+				float3 finCol = directDiffuse*diffuseColor + direSpec;
+				float4 col = float4(finCol*1,0);
+				// apply fog
+				UNITY_APPLY_FOG(i.fogCoord, col);
+				return col;
+			}
+			ENDCG
+		}
+    
 	}
+	FallBack "Standard (Specular setup)"
 }
